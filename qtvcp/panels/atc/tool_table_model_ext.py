@@ -40,8 +40,13 @@ import queue
 from qtvcp.core import Status, Info
 from qtvcp import qt_tstat
 from qtvcp.widgets.tool_offsetview import MyTableModel
-from PyQt5.QtCore import Qt, QModelIndex, QVariant, QLocale
-from PyQt5.QtWidgets import QCheckBox, QItemEditorFactory, QDoubleSpinBox, QSpinBox, QStyledItemDelegate
+from PyQt5.QtCore import Qt, QModelIndex, QVariant, QLocale, QRect, QEvent
+from PyQt5.QtGui import QColor, QBrush
+from PyQt5.QtWidgets import (
+	QCheckBox, QItemEditorFactory, QDoubleSpinBox, QSpinBox,
+	QStyledItemDelegate, QAbstractSpinBox, QApplication, QStyle,
+	QStyleOptionViewItem, QStyleOptionButton,QHeaderView
+)
 try:
 	import linuxcnc
 except ImportError:
@@ -69,6 +74,41 @@ def _find_column(headerdata, aliases, start=0):
 		if name is not None and str(name).strip().lower() in aliases:
 			return i
 	return None
+
+def fmt_trim_zeros(value, decimals):
+	"""До `decimals` знаков после точки, без хвостовых нулей, но минимум
+	1 знак после точки всегда остаётся (0 -> "0.0", 10 -> "10.0",
+	1.5 -> "1.5", не "1.5000000"). Используется и для Z, и для R —
+	чтобы не дублировать одну и ту же обрезку в двух местах."""
+	text = ('%.*f' % (decimals, float(value))).rstrip('0')
+	if text.endswith('.'):
+		text += '0'
+	return text
+
+def _brighten_bg(value):
+	"""Усиливает подсветку строки текущего в шпинделе инструмента.
+
+	Фреймворк отдаёт для неё бледный/полупрозрачный цвет через
+	BackgroundRole — плохо заметный. Не подставляем свой цвет с нуля
+	(сломается при смене темы/стиля), а берём ТОТ ЖЕ цвет и поднимаем
+	насыщенность и минимальную яркость/непрозрачность. Для остальных
+	строк (BackgroundRole не задан/невалиден) возвращаем как есть.
+	"""
+	color = None
+	if isinstance(value, QColor):
+		color = value
+	elif isinstance(value, QBrush):
+		color = value.color()
+	if color is None or not color.isValid():
+		return value
+	h, s, v, a = color.getHsv()
+	if h < 0:  # серый/чёрный/белый — без цветового тона, не усиливаем
+		return value
+	s = min(255, int(s * 2.2))
+	v = max(v, 210)
+	a = min(255, int(a * 1.3)) if a else 255
+	brighter = QColor.fromHsv(h, s, v, a)
+	return QBrush(brighter) if isinstance(value, QBrush) else brighter
 
 def operator_message(text, level='ERROR'):
 	"""Сообщение оператору в LinuxCNC (error channel + machine log)."""
@@ -211,6 +251,7 @@ class ToolTableModelExt(MyTableModel):
 		self._headers_ready = False
 		self._random_tc = False
 		self._pocket_col = None
+		self._z_col = None
 		# Безопасные значения ПО УМОЛЧАНИЮ — MyTableModel.__init__() сам
 		# вызывает self.update(None) (см. tool_offsetview.py:375) ещё ДО
 		# того, как мы ниже успеем посчитать реальные n_std/_tool_col/
@@ -254,6 +295,12 @@ class ToolTableModelExt(MyTableModel):
 		# уникальность. Сам флаг _random_tc обновляется из list_tools().
 		self._pocket_col = _find_column(
 			self.headerdata, {'pocket', 'p', 'poc'})
+
+		# Индекс колонки Z — нужен, чтобы показывать больше знаков после
+		# точки в режиме отображения (не только при редактировании,
+		# см. data()/DisplayRole ниже). Точное совпадение 'z', чтобы не
+		# зацепить 'z wear'.
+		self._z_col = _find_column(self.headerdata, {'z'})
 			
 		# Индекс колонки Comment — тоже по заголовку, один раз, чтобы
 		# не искать её заново на каждый update()/arrange_columns().
@@ -401,9 +448,43 @@ class ToolTableModelExt(MyTableModel):
 	# удаления") просочился бы во все расширенные колонки.
 	_STYLE_ROLES = (Qt.BackgroundRole, Qt.ForegroundRole)
 
+	def _is_spindle_tool_row(self, row):
+		"""Строка ли это текущего в шпинделе инструмента (а не просто
+		отмеченная чекбоксом «выбрать для удаления» — у него тоже своя
+		подсветка через BackgroundRole, её усиливать не нужно)."""
+		try:
+			tno = int(self.arraydata[row][self._tool_col])
+		except (IndexError, TypeError, ValueError):
+			return False
+		try:
+			cur = int(STATUS.get_current_tool() or 0)
+		except Exception:
+			return False
+		return tno == cur and tno > 0
+
 	def data(self, index, role=Qt.DisplayRole):
 		col = index.column()
 		if col < self.n_std:
+			if col == self._z_col and role == Qt.DisplayRole:
+				# Больше знаков после точки в ОБЫЧНОМ (не редактируемом)
+				# режиме — сама ячейка/редактор (QDoubleSpinBox,
+				# setDecimals(7)) тут не участвует, это чисто текст.
+				# Хвостовые нули убираем, но минимум 1 знак после точки
+				# оставляем (0 -> "0.0", 1.5 -> "1.5", не "1.5000000").
+				raw = super().data(index, Qt.EditRole)
+				try:
+					return fmt_trim_zeros(raw, 7)
+				except (TypeError, ValueError):
+					pass
+			if role == Qt.TextAlignmentRole and col != self._comment_col:
+				# Comment — обычный текст слева, читаемость важнее;
+				# всё остальное (числа, tool, pocket) — по центру.
+				return Qt.AlignCenter
+			if role == Qt.BackgroundRole:
+				bg = super().data(index, role)
+				if self._is_spindle_tool_row(index.row()):
+					return _brighten_bg(bg)
+				return bg
 			return super().data(index, role)
 			
 		try:
@@ -415,6 +496,8 @@ class ToolTableModelExt(MyTableModel):
 		if letter in ('H', 'L'):  # Heavy / Big — чекбокс, не текст/комбобокс
 			if role == Qt.CheckStateRole:
 				return Qt.Checked if value else Qt.Unchecked
+			if role == Qt.TextAlignmentRole:
+				return Qt.AlignCenter
 			if role in self._STYLE_ROLES:
 				return self._row_style(index.row(), role)
 			# ни DisplayRole, ни EditRole не отдаём текст — иначе Qt
@@ -425,7 +508,7 @@ class ToolTableModelExt(MyTableModel):
 			
 		if role == Qt.DisplayRole:
 			if letter == 'R':  # Diameter
-				return '%.3f' % float(value or 0)
+				return fmt_trim_zeros(value or 0, 3)
 			if letter == 'S':  # Runtime — hh:mm:ss
 				return seconds_to_hms(value)
 			return None
@@ -436,6 +519,8 @@ class ToolTableModelExt(MyTableModel):
 				
 			return value
 			
+		if role == Qt.TextAlignmentRole:
+			return Qt.AlignCenter
 		if role in self._STYLE_ROLES:
 			return self._row_style(index.row(), role)
 		return None
@@ -448,9 +533,12 @@ class ToolTableModelExt(MyTableModel):
 		относящиеся к чекбоксу/значению/редактированию, сюда не
 		передаются — см. _STYLE_ROLES."""
 		try:
-			return super().data(self.index(row, 0), role)
+			result = super().data(self.index(row, 0), role)
 		except Exception:
 			return None
+		if role == Qt.BackgroundRole and self._is_spindle_tool_row(row):
+			return _brighten_bg(result)
+		return result
 
 
 	def flags(self, index):
@@ -1012,20 +1100,120 @@ def bind_ext_add_tool(view_instance, db_client):
 # Штатный QDoubleSpinBox берёт разделитель из локали системы
 # (в ru_RU — запятая) → при правке запятая, в ячейке точка.
 # Для tool table / G-code LinuxCNC стандарт — точка (locale "C").
+class _CenteredCheckBoxDelegate(QStyledItemDelegate):
+	"""Чекбокс по центру ячейки.
+
+	Qt.TextAlignmentRole на положение самого индикатора чекбокса не
+	влияет — это ограничение стандартного стиля: CE_ItemViewItem рисует
+	check-индикатор всегда у левого края option.rect, TextAlignmentRole
+	отвечает только за текст. Поэтому фон/подсветку рисуем как обычно
+	через стиль, а сам индикатор — вручную, в прямоугольнике по центру
+	ячейки. Клик обрабатываем в editorEvent по тому же прямоугольнику,
+	вместо editor'а (тут его нет и не нужно, см. ItemIsUserCheckable
+	без ItemIsEditable в модели).
+	"""
+
+	def _check_rect(self, option):
+		style = option.widget.style() if option.widget else QApplication.style()
+		w = style.pixelMetric(QStyle.PM_IndicatorWidth, option, option.widget)
+		h = style.pixelMetric(QStyle.PM_IndicatorHeight, option, option.widget)
+		x = option.rect.x() + (option.rect.width() - w) // 2
+		y = option.rect.y() + (option.rect.height() - h) // 2
+		return QRect(x, y, w, h)
+
+	def paint(self, painter, option, index):
+		check_state = index.data(Qt.CheckStateRole)
+		if check_state is None:
+			return super().paint(painter, option, index)
+
+		style = option.widget.style() if option.widget else QApplication.style()
+
+		# фон/подсветка строки — штатно, но без штатного (левого)
+		# индикатора и без текста, индикатор дорисуем сами поверх
+		opt = QStyleOptionViewItem(option)
+		self.initStyleOption(opt, index)
+		opt.text = ''
+		opt.features &= ~QStyleOptionViewItem.HasCheckIndicator
+		style.drawControl(QStyle.CE_ItemViewItem, opt, painter)
+
+		check_opt = QStyleOptionButton()
+		check_opt.rect = self._check_rect(option)
+		check_opt.state = QStyle.State_Enabled
+		check_opt.state |= (QStyle.State_On if check_state == Qt.Checked
+							 else QStyle.State_Off)
+		style.drawPrimitive(QStyle.PE_IndicatorCheckBox, check_opt, painter)
+
+	def editorEvent(self, event, model, option, index):
+		flags = model.flags(index)
+		if not (flags & Qt.ItemIsUserCheckable) or not (flags & Qt.ItemIsEnabled):
+			return super().editorEvent(event, model, option, index)
+		if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+			if self._check_rect(option).contains(event.pos()):
+				cur = index.data(Qt.CheckStateRole)
+				new_state = Qt.Unchecked if cur == Qt.Checked else Qt.Checked
+				model.setData(index, new_state, Qt.CheckStateRole)
+			return True
+		if event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick):
+			return True
+		return super().editorEvent(event, model, option, index)
+
+
+def bind_centered_checkboxes(view_instance, model):
+	"""Ставит _CenteredCheckBoxDelegate на колонки Heavy/Big.
+
+	Персональный делегат на колонку (setItemDelegateForColumn) имеет
+	приоритет над делегатом всего view — install_tooltable_number_editors
+	это не затрагивает (тот работает с делегатом остальных колонок).
+	"""
+	if view_instance is None or model is None:
+		return
+	letter_by_col = getattr(model, '_letter_by_col', {}) or {}
+	cols = [col for col, letter in letter_by_col.items() if letter in ('H', 'L')]
+	if not cols:
+		return
+	delegate = _CenteredCheckBoxDelegate(view_instance)
+	view_instance._centered_checkbox_delegate = delegate  # держим ссылку живой
+	for col in cols:
+		view_instance.setItemDelegateForColumn(col, delegate)
+
+
+class _TrimmedDoubleSpinBox(QDoubleSpinBox):
+	"""QDoubleSpinBox, который показывает значение без хвостовых нулей
+	после точки (до setDecimals() знаков), но минимум один знак после
+	точки — целое число выглядит как "5.0", а не "5" и не
+	"5.0000000". Та же логика, что и fmt_trim_zeros() для отображения
+	ячейки вне редактирования — просто здесь textFromValue/
+	valueFromText, а не data()."""
+
+	def textFromValue(self, value):
+		return fmt_trim_zeros(value, self.decimals())
+
+	def valueFromText(self, text):
+		text = text.strip()
+		if not text or text in ('-', '.', '-.'):
+			return 0.0
+		try:
+			return float(text)
+		except ValueError:
+			return 0.0
+
+
 class _ToolTableItemEditorFactory(QItemEditorFactory):
 	def createEditor(self, userType, parent):
 		if userType == QVariant.Double:
-			box = QDoubleSpinBox(parent)
+			box = _TrimmedDoubleSpinBox(parent)
 			box.setLocale(QLocale.c())  # decimal point = '.'
-			box.setDecimals(4)
+			box.setDecimals(7)
 			box.setMaximum(99999)
 			box.setMinimum(-99999)
+			box.setButtonSymbols(QAbstractSpinBox.NoButtons)
 			return box
 		if userType == QVariant.Int:
 			box = QSpinBox(parent)
 			box.setLocale(QLocale.c())
 			box.setMaximum(20000)
 			box.setMinimum(0)
+			box.setButtonSymbols(QAbstractSpinBox.NoButtons)
 			return box
 		return super(_ToolTableItemEditorFactory, self).createEditor(
 			userType, parent)
@@ -1090,16 +1278,16 @@ def arrange_columns(view, model=None):
 		if cur >= 0 and cur != last_visual:
 			header.moveSection(cur, last_visual)
 
-		# мин. ширина X/Y/Z — 6 символов.
+		# мин. ширина X/Y/Z — 6 символов, Z — на 3 символа шире остальных.
 		# В createAllView() стоит hh.setSectionResizeMode(3) =
 		# ResizeToContents → setColumnWidth игнорируется. Для этих
 		# колонок переключаем режим на Interactive и задаём ширину.
-		from PyQt5.QtWidgets import QHeaderView
 		fm = view.fontMetrics()
 		char_w = (fm.horizontalAdvance('0')
 				  if hasattr(fm, 'horizontalAdvance') else fm.width('0'))
 		# 6 значащих + запас под знак/точку/padding шаблона %10.3f
 		min_w = max(int(char_w * 6) + 8, 1)
+		min_w_z = max(int(char_w * 12) + 8, 1)  # Z шире — под 7 знаков после точки
 		hdr = list(getattr(model, 'headerdata', []) or [])
 		for axis in ('x', 'y', 'z'):
 			col = None
@@ -1115,8 +1303,9 @@ def arrange_columns(view, model=None):
 				header.setSectionResizeMode(col, QHeaderView.Interactive)
 			except Exception:
 				pass
+			target_w = min_w_z if axis == 'z' else min_w
 			cur_w = view.columnWidth(col)
-			if cur_w < min_w:
-				view.setColumnWidth(col, min_w)
+			if cur_w < target_w:
+				view.setColumnWidth(col, target_w)
 	except Exception:
 		pass
