@@ -609,17 +609,42 @@ class ToolDB:
 				"UPDATE state SET value = CAST(value AS INTEGER) + 1 "
 				"WHERE key='changed_seq'")
 			self.conn.commit()
+			# ВАЖНО: после СВОЕГО commit обновляем guard, иначе 1с-watcher
+			# увидит смену mtime/-wal и вызовет load_tool_table() —
+			# в AUTO это даёт «не могу делать это (EMC_TOOL_LOAD_TOOL_TABLE)».
+			self._external_change_guard = self._current_mtime()
 			row = self.conn.execute(
 				"SELECT value FROM state WHERE key='changed_seq'").fetchone()
 			seq = int(row['value'])
 		self._reconcile_registration()
 		# load_tool_table ТОЛЬКО если изменение пришло НЕ из put LinuxCNC
+		# (put уже передал данные интерпретатору; повторный reload в AUTO
+		# запрещён при читающем интерпретаторе).
 		if not from_linuxcnc:
 			self.notify_linuxcnc_reload()
 		notify_subscribers(seq)
 
 	def notify_linuxcnc_reload(self):
+		"""Перечитать таблицу инструментов в LinuxCNC.
+
+		В AUTO с читающим интерпретатором EMC_TOOL_LOAD_TOOL_TABLE
+		запрещён (ошибка «не могу делать это … в авто режиме»).
+		Пропускаем вызов; данные из put/G10 уже в интерпретаторе,
+		а виджет обновится через push notify_subscribers.
+		"""
 		if linuxcnc is None:
+			return
+		try:
+			s = linuxcnc.stat()
+			s.poll()
+			# MODE_AUTO == 2; INTERP_READING / INTERP_WAITING — активный УП
+			if s.task_mode == linuxcnc.MODE_AUTO and s.interp_state != linuxcnc.INTERP_IDLE:
+				msg("notify_linuxcnc_reload skipped: AUTO + interp busy "
+					"(task_mode=%s interp_state=%s)" % (s.task_mode, s.interp_state))
+				return
+		except Exception as e:
+			msg("notify_linuxcnc_reload stat poll failed: %s" % e)
+			# при сбое poll безопаснее не слать reload в неизвестном состоянии
 			return
 		try:
 			if self._lcnc_cmd is None:
