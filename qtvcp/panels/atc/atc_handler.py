@@ -18,6 +18,7 @@ from tool_table_model_ext import (
     ToolTableModelExt, patch_tool_singleton_for_db_program,
     bind_ext_show_selection, bind_ext_add_tool,
     arrange_columns, install_tooltable_number_editors,
+    bind_centered_checkboxes
 )
 
 #import inspect
@@ -154,6 +155,7 @@ class HandlerClass:
 				# дублирует параметры текущей строки вместо создания
 				# нового инструмента с номером max+1 и пустыми полями
 				bind_ext_add_tool(self.toolTableWidget, self.tool_db_client)
+				bind_centered_checkboxes(self.toolTableWidget, ext_model)
 				
 				install_tooltable_number_editors(self.toolTableWidget)
 				arrange_columns(self.toolTableWidget, ext_model)
