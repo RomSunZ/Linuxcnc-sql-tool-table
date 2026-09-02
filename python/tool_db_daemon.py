@@ -209,6 +209,21 @@ class Tool:
 				attr, typ = spec
 				setattr(self, attr, bool(val) if typ is bool else typ(val))
 
+	@classmethod
+	def fields_touch_std_columns(cls, fields):
+		"""True, если среди переданных полей есть хотя бы одно STD-поле
+		(P/X/Y/Z/A/B/C/U/V/W/D/I/J/Q/comment) — то есть видимое LinuxCNC
+		через ответ на 'g'. R/H/L/S сюда никогда не относятся — по ним
+		load_tool_table() дёргать незачем (см. докстринг модуля)."""
+		for key in fields:
+			k = str(key).strip()
+			if k.lower() == 'comment':
+				return True
+			spec = cls.LETTER_MAP.get(k.upper())
+			if spec and spec[0] in cls.STD_COLUMNS:
+				return True
+		return False
+
 	def to_lcnc_line(self):
 		"""Строка, которую понимает LinuxCNC (ответ на 'g') — ТОЛЬКО
 		стандартные буквы. R/H/L/S сюда никогда не попадают — LinuxCNC
@@ -226,34 +241,6 @@ class Tool:
 		if self.comment:
 			line += " ;%s" % self.comment
 		return line
-
-
-# =====================================================================
-# HAL — пины для G-кода (#<_hal[toolext.r]> и т.п.), НЕ для уведомлений
-# =====================================================================
-halcomp = None
-if hal is not None:
-	try:
-		halcomp = hal.component("toolext")
-		halcomp.newpin("r", hal.HAL_FLOAT, hal.HAL_OUT)   # диаметр
-		halcomp.newpin("h", hal.HAL_BIT, hal.HAL_OUT)     # тяжёлый
-		halcomp.newpin("l", hal.HAL_BIT, hal.HAL_OUT)     # крупный
-		halcomp.newpin("s", hal.HAL_FLOAT, hal.HAL_OUT)   # наработка
-		halcomp.ready()
-	except Exception as e:
-		msg("HAL component failed: %s" % e)
-		halcomp = None
-
-
-def update_hal_pins(tool):
-	if halcomp is None:
-		return
-	if tool is None:
-		tool = Tool.empty(0)
-	halcomp['r'] = float(tool.r)
-	halcomp['h'] = bool(tool.h)
-	halcomp['l'] = bool(tool.l)
-	halcomp['s'] = float(tool.s)
 
 
 # =====================================================================
@@ -298,9 +285,19 @@ def process_request(req):
 	tno = req.get("toolno")
 
 	if op == "list":
-		tools = {n: db.get(n).to_row_dict() for n in db.all_tool_numbers()}
+		# один bulk SELECT вместо N отдельных locked-запросов (get() на
+		# каждый номер) — см. get_all().
+		tools = db.get_all()
 		return {"ok": True, "tools": tools, "spindle_tool": db.get_spindle_tool(),
 				"random_tool_changer": bool(RANDOM_TC)}
+
+	if op == "get":
+		# лёгкая операция для одного инструмента — не гонять весь список
+		# ради одного значения (см. ToolDBClient.get_tool на клиенте).
+		if tno is None:
+			return {"ok": False, "error": "toolno required"}
+		t = db.get(int(tno))
+		return {"ok": True, "tool": t.to_row_dict() if t else None}
 
 	if op == "create":
 		if tno is None:
@@ -311,7 +308,9 @@ def process_request(req):
 		t = Tool.empty(tno)
 		t.apply_fields(req.get("fields") or {})
 		t.p = tno
-		db.upsert(t)
+		# новый инструмент всегда меняет P/список известных номеров —
+		# LinuxCNC должен узнать об этом в любом случае.
+		db.upsert(t, notify_lcnc=True)
 		return {"ok": True, "tool": t.to_row_dict()}
 
 	if op == "update":
@@ -481,7 +480,18 @@ class ToolDB:
 			rows = self.conn.execute("SELECT toolno FROM tools").fetchall()
 		return sorted(r['toolno'] for r in rows)
 
-	def upsert(self, tool, from_linuxcnc=False):
+	def get_all(self):
+		"""Все инструменты одним запросом (для op=='list') — вместо N
+		отдельных locked SELECT (get() на каждый номер по очереди)."""
+		with self._lock:
+			rows = self.conn.execute("SELECT * FROM tools").fetchall()
+		return {row['toolno']: Tool.from_row(row).to_row_dict() for row in rows}
+
+	def upsert(self, tool, from_linuxcnc=False, notify_lcnc=True):
+		"""notify_lcnc=False — не дёргать load_tool_table() вовсе (для
+		правок, состоящих только из R/H/L/S — LinuxCNC эти поля не видит,
+		см. Tool.fields_touch_std_columns). Игнорируется, если
+		from_linuxcnc=True (тогда reload и так пропускается)."""
 		d = tool.to_row_dict()
 		cols = list(d.keys())
 		collist = ", ".join(cols)
@@ -491,9 +501,15 @@ class ToolDB:
 			   f"ON CONFLICT(toolno) DO UPDATE SET {updates}")
 		with self._lock:
 			self.conn.execute(sql, [tool.tno] + [d[c] for c in cols])
+			# changed_seq в ТОЙ ЖЕ транзакции — один commit (один fsync)
+			# вместо двух (раньше: этот commit + отдельный commit внутри
+			# отдельного шага увеличения changed_seq).
+			self.conn.execute(
+				"UPDATE state SET value = CAST(value AS INTEGER) + 1 "
+				"WHERE key='changed_seq'")
 			self.conn.commit()
 			self._external_change_guard = self._current_mtime()
-		self.bump_changed(from_linuxcnc=from_linuxcnc)
+		self._finalize_write(from_linuxcnc=from_linuxcnc, notify_lcnc=notify_lcnc)
 
 	def apply_from_wire_params(self, tno, params):
 		"""G10 L1/L10/L11 — буквенный протокол.
@@ -505,10 +521,15 @@ class ToolDB:
 		return t
 
 	def apply_fields(self, tno, fields):
-		"""Правка из сокета — тоже только буквы (см. Tool.apply_fields)."""
+		"""Правка из сокета — тоже только буквы (см. Tool.apply_fields).
+
+		Если среди fields нет ни одного STD-поля (только R/H/L/S) —
+		load_tool_table() не вызывается: LinuxCNC эти буквы всё равно
+		никогда не увидит (см. to_lcnc_line/fields_touch_std_columns)."""
 		t = self.get(tno) or Tool(tno=tno, p=tno)
 		t.apply_fields(fields)
-		self.upsert(t)
+		notify_lcnc = Tool.fields_touch_std_columns(fields)
+		self.upsert(t, notify_lcnc=notify_lcnc)
 		return t
 
 	def delete(self, tno):
@@ -518,9 +539,12 @@ class ToolDB:
 			raise ValueError("Tool T%d is now in spindle" % tno)
 		with self._lock:
 			self.conn.execute("DELETE FROM tools WHERE toolno=?", (tno,))
+			self.conn.execute(
+				"UPDATE state SET value = CAST(value AS INTEGER) + 1 "
+				"WHERE key='changed_seq'")
 			self.conn.commit()
 			self._external_change_guard = self._current_mtime()
-		self.bump_changed()
+		self._finalize_write()
 
 	def rename(self, old_tno, new_tno):
 		"""Сменить PRIMARY KEY toolno in-place (без create/delete)."""
@@ -550,9 +574,12 @@ class ToolDB:
 				self.conn.execute(
 					"UPDATE state SET value=? WHERE key='spindle_tool'",
 					(str(new_tno),))
+			self.conn.execute(
+				"UPDATE state SET value = CAST(value AS INTEGER) + 1 "
+				"WHERE key='changed_seq'")
 			self.conn.commit()
 			self._external_change_guard = self._current_mtime()
-		self.bump_changed()
+		self._finalize_write()
 		return self.get(new_tno)
 
 
@@ -603,24 +630,27 @@ class ToolDB:
 		self._known_set = current
 
 	# ------------------------------------------------------------ уведомления
-	def bump_changed(self, from_linuxcnc=False):
+	def _finalize_write(self, from_linuxcnc=False, notify_lcnc=True):
+		"""Реестр + уведомления ПОСЛЕ того, как вызывающий код уже сам
+		обновил changed_seq и сделал ОДИН commit вместе с основной записью
+		(так вместо двух commit/fsync на одну правку — один).
+
+		notify_lcnc=False — не звать load_tool_table() вовсе: используется,
+		когда правка состоит только из R/H/L/S — LinuxCNC эти буквы не
+		видит (нет в to_lcnc_line/ответе на 'g'), реальный reload таблицы
+		инструментов ему ничего не даст, только лишняя нагрузка.
+
+		from_linuxcnc=True (правка пришла из put/G10) всегда имеет
+		приоритет и отключает reload — put уже передал данные
+		интерпретатору; повторный reload в AUTO запрещён при читающем
+		интерпретаторе.
+		"""
 		with self._lock:
-			self.conn.execute(
-				"UPDATE state SET value = CAST(value AS INTEGER) + 1 "
-				"WHERE key='changed_seq'")
-			self.conn.commit()
-			# ВАЖНО: после СВОЕГО commit обновляем guard, иначе 1с-watcher
-			# увидит смену mtime/-wal и вызовет load_tool_table() —
-			# в AUTO это даёт «не могу делать это (EMC_TOOL_LOAD_TOOL_TABLE)».
-			self._external_change_guard = self._current_mtime()
 			row = self.conn.execute(
 				"SELECT value FROM state WHERE key='changed_seq'").fetchone()
-			seq = int(row['value'])
+		seq = int(row['value'])
 		self._reconcile_registration()
-		# load_tool_table ТОЛЬКО если изменение пришло НЕ из put LinuxCNC
-		# (put уже передал данные интерпретатору; повторный reload в AUTO
-		# запрещён при читающем интерпретаторе).
-		if not from_linuxcnc:
+		if not from_linuxcnc and notify_lcnc:
 			self.notify_linuxcnc_reload()
 		notify_subscribers(seq)
 
@@ -687,9 +717,7 @@ def user_get_tool(tno):
 
 def user_put_tool(tno, params):
 	"""G10 L1 / L10 / L11"""
-	t = db.apply_from_wire_params(tno, params)
-	if tno == db.get_spindle_tool():
-		update_hal_pins(t)
+	db.apply_from_wire_params(tno, params)
 	msg("put T%d → %s" % (tno, params))
 
 
@@ -705,18 +733,15 @@ def _parse_tp(params):
 
 def user_load_spindle_nonran(tno, params):
 	db.set_spindle_tool(tno)
-	update_hal_pins(db.get(tno))
 
 
 def user_unload_spindle_nonran(tno, params):
 	db.set_spindle_tool(0)
-	update_hal_pins(db.get(0))
 
 
 def user_load_spindle_random(tno, params):
 	db.set_pocket(tno, 0)
 	db.set_spindle_tool(tno)
-	update_hal_pins(db.get(tno))
 
 
 def user_unload_spindle_random(tno, params):
@@ -724,7 +749,6 @@ def user_unload_spindle_random(tno, params):
 	if pocket is not None:
 		db.set_pocket(tno, pocket)
 	db.set_spindle_tool(0)
-	update_hal_pins(db.get(0))
 
 
 # =====================================================================
@@ -742,10 +766,6 @@ def runtime_tick():
 			motion_type, spindle_on = 0, False
 		if spindle_on and motion_type in CUTTING_MOTION_TYPES:
 			db.add_runtime(spindle_tool, 1.0)
-			if halcomp is not None:
-				t = db.get(spindle_tool)
-				if t:
-					halcomp['s'] = t.s
 
 	runtime_timer = threading.Timer(1.0, runtime_tick)
 	runtime_timer.daemon = True
