@@ -40,12 +40,12 @@ import queue
 from qtvcp.core import Status, Info
 from qtvcp import qt_tstat
 from qtvcp.widgets.tool_offsetview import MyTableModel
-from PyQt5.QtCore import Qt, QModelIndex, QVariant, QLocale, QRect, QEvent
+from PyQt5.QtCore import Qt, QModelIndex, QVariant, QLocale, QRect, QEvent, QTimer
 from PyQt5.QtGui import QColor, QBrush
 from PyQt5.QtWidgets import (
 	QCheckBox, QItemEditorFactory, QDoubleSpinBox, QSpinBox,
 	QStyledItemDelegate, QAbstractSpinBox, QApplication, QStyle,
-	QStyleOptionViewItem, QStyleOptionButton,QHeaderView
+	QStyleOptionViewItem, QStyleOptionButton, QHeaderView, QAbstractItemView
 )
 try:
 	import linuxcnc
@@ -85,6 +85,9 @@ def fmt_trim_zeros(value, decimals):
 		text += '0'
 	return text
 
+# Светло-голубой фон строки текущего инструмента в шпинделе
+_SPINDLE_TOOL_BG = QColor(173, 216, 230)  # lightblue
+
 def _brighten_bg(value):
 	"""Усиливает подсветку строки текущего в шпинделе инструмента.
 
@@ -93,6 +96,10 @@ def _brighten_bg(value):
 	(сломается при смене темы/стиля), а берём ТОТ ЖЕ цвет и поднимаем
 	насыщенность и минимальную яркость/непрозрачность. Для остальных
 	строк (BackgroundRole не задан/невалиден) возвращаем как есть.
+
+	Сейчас для текущего инструмента используется фиксированный
+	светло-голубой (_SPINDLE_TOOL_BG); функция оставлена на случай
+	повторного использования для других ролей.
 	"""
 	color = None
 	if isinstance(value, QColor):
@@ -301,6 +308,11 @@ class ToolTableModelExt(MyTableModel):
 		# см. data()/DisplayRole ниже). Точное совпадение 'z', чтобы не
 		# зацепить 'z wear'.
 		self._z_col = _find_column(self.headerdata, {'z'})
+
+		# Индекс колонки 'D Wear' (см. переименование выше) — нужен, чтобы
+		# при правке R брать текущий D локально из arraydata и не делать
+		# лишний round-trip get_tool() в _notify_tool_info_changed.
+		self._d_col = _find_column(self.headerdata, {'d wear'})
 			
 		# Индекс колонки Comment — тоже по заголовку, один раз, чтобы
 		# не искать её заново на каждый update()/arrange_columns().
@@ -312,6 +324,7 @@ class ToolTableModelExt(MyTableModel):
 		# ищем строго в хвосте headerdata (после n_std), чтобы не
 		# зацепить переименованный стандартный 'Diameter'->'D Wear'.
 		self._letter_by_col = {}
+		self._r_col = None
 		for name, letter in self.EXT_FIELD_BY_NAME.items():
 			col = _find_column(self.headerdata, {name.lower()}, start=self.n_std)
 			if col is None:
@@ -319,9 +332,28 @@ class ToolTableModelExt(MyTableModel):
 						  "не найдена в заголовках".format(name))
 				continue
 			self._letter_by_col[col] = letter
+			if letter == 'R':
+				self._r_col = col
 
 		# Добить строки arraydata до полной ширины (если update уже отработал)
 		self._pad_rows()
+
+	def _known_dia_r(self, row):
+		"""Текущие D Wear/R Diameter из уже загруженной строки — чтобы
+		вызовы _notify_tool_info_changed после правок, не затрагивающих
+		D/R (rename, comment), не делали лишний round-trip get_tool()."""
+		dia = r = None
+		if self._d_col is not None:
+			try:
+				dia = float(self.arraydata[row][self._d_col])
+			except (TypeError, ValueError, IndexError):
+				dia = None
+		if self._r_col is not None:
+			try:
+				r = float(self.arraydata[row][self._r_col])
+			except (TypeError, ValueError, IndexError):
+				r = None
+		return dia, r
 
 	def _ensure_checkboxes(self):
 		"""Колонка 0 в wear-модели — всегда QCheckBox.
@@ -382,7 +414,14 @@ class ToolTableModelExt(MyTableModel):
 		ext_by_tool = {}
 		if self._db_client is not None:
 			try:
-				resp = self._db_client.list_tools()
+				# сначала — ответ, который для ЭТОГО ЖЕ цикла обновления
+				# уже получил patch_tool_singleton_for_db_program._reload()
+				# (см. _shared_list_tools_cache выше). Если его нет
+				# (например, update() вызван отдельно от _reload()) —
+				# запрашиваем сами, как и раньше.
+				resp = _shared_list_tools_cache.pop('resp', None)
+				if resp is None:
+					resp = self._db_client.list_tools()
 				if resp and resp.get('ok'):
 					self._random_tc = bool(resp.get('random_tool_changer', False))
 					for key, rec in (resp.get('tools') or {}).items():
@@ -448,20 +487,6 @@ class ToolTableModelExt(MyTableModel):
 	# удаления") просочился бы во все расширенные колонки.
 	_STYLE_ROLES = (Qt.BackgroundRole, Qt.ForegroundRole)
 
-	def _is_spindle_tool_row(self, row):
-		"""Строка ли это текущего в шпинделе инструмента (а не просто
-		отмеченная чекбоксом «выбрать для удаления» — у него тоже своя
-		подсветка через BackgroundRole, её усиливать не нужно)."""
-		try:
-			tno = int(self.arraydata[row][self._tool_col])
-		except (IndexError, TypeError, ValueError):
-			return False
-		try:
-			cur = int(STATUS.get_current_tool() or 0)
-		except Exception:
-			return False
-		return tno == cur and tno > 0
-
 	def data(self, index, role=Qt.DisplayRole):
 		col = index.column()
 		if col < self.n_std:
@@ -481,10 +506,9 @@ class ToolTableModelExt(MyTableModel):
 				# всё остальное (числа, tool, pocket) — по центру.
 				return Qt.AlignCenter
 			if role == Qt.BackgroundRole:
-				bg = super().data(index, role)
+				# строка текущего инструмента — светло-голубой фон
 				if self._is_spindle_tool_row(index.row()):
-					return _brighten_bg(bg)
-				return bg
+					return _SPINDLE_TOOL_BG
 			return super().data(index, role)
 			
 		try:
@@ -525,6 +549,22 @@ class ToolTableModelExt(MyTableModel):
 			return self._row_style(index.row(), role)
 		return None
 
+	def _is_spindle_tool_row(self, row):
+		"""Строка ли это текущего в шпинделе инструмента (а не просто
+		отмеченная чекбоксом «выбрать для удаления» — у него тоже своя
+		подсветка через BackgroundRole). Только STATUS — без list_tools,
+		чтобы не тормозить отрисовку каждой ячейки."""
+		try:
+			tno = int(self.arraydata[row][self._tool_col])
+		except (IndexError, TypeError, ValueError):
+			return False
+		if tno <= 0:
+			return False
+		try:
+			return int(STATUS.get_current_tool() or 0) == tno
+		except Exception:
+			return False
+
 	def _row_style(self, row, role):
 		"""Оформление строки (подсветка выбранной для удаления строки,
 		цвет текста и т.п.) берём со стандартной колонки 0 той же строки —
@@ -532,12 +572,12 @@ class ToolTableModelExt(MyTableModel):
 		(подсвечивалась только стандартная часть строки). Роли,
 		относящиеся к чекбоксу/значению/редактированию, сюда не
 		передаются — см. _STYLE_ROLES."""
+		if role == Qt.BackgroundRole and self._is_spindle_tool_row(row):
+			return _SPINDLE_TOOL_BG
 		try:
 			result = super().data(self.index(row, 0), role)
 		except Exception:
 			return None
-		if role == Qt.BackgroundRole and self._is_spindle_tool_row(row):
-			return _brighten_bg(result)
 		return result
 
 
@@ -663,7 +703,9 @@ class ToolTableModelExt(MyTableModel):
 						except Exception:
 							pass					
 					self.dataChanged.emit(index, index)
-					_notify_tool_info_changed(new_tno, self._db_client)
+					dia, r = self._known_dia_r(row)
+					_notify_tool_info_changed(new_tno, self._db_client,
+											   diameter=dia, r_diam=r)
 					return True
 				return True
 
@@ -744,7 +786,9 @@ class ToolTableModelExt(MyTableModel):
 					pass
 				ok = super().setData(index, comment, role)
 				self.dataChanged.emit(index, index)
-				_notify_tool_info_changed(tool_no, self._db_client)
+				dia, r = self._known_dia_r(row)
+				_notify_tool_info_changed(tool_no, self._db_client,
+										   diameter=dia, r_diam=r)
 				return True if ok is None else bool(ok)
 
 			return super().setData(index, value, role)
@@ -781,14 +825,52 @@ class ToolTableModelExt(MyTableModel):
 			return False
 		self.arraydata[row][col] = v
 		self.dataChanged.emit(index, index)
-		# D wear / comment / diameter-зависимые StatusLabel
-		_notify_tool_info_changed(tool_no, self._db_client)
+		# StatusLabel (.diameter/.r) зависит ТОЛЬКО от R — H/L/S там не
+		# участвуют, звать уведомление ради них незачем. Для R передаём
+		# уже известные значения (v и текущий D Wear из arraydata),
+		# чтобы _notify_tool_info_changed не делала лишний round-trip
+		# get_tool() в демон ради того, что мы и так только что записали.
+		if letter == 'R':
+			dia, _r = self._known_dia_r(row)
+			_notify_tool_info_changed(tool_no, self._db_client,
+									   diameter=dia, r_diam=v)
 		return True
 
 # =====================================================================
 # 2. Tool()-синглтон — переопределяем методы на КОНКРЕТНОМ объекте
 # =====================================================================
+
+def _std_field_equal(letter, old, new):
+	"""Сравнение значения STD-поля для diff'а в _save() (см. ниже) —
+	float с допуском на погрешность, comment — строкой."""
+	if old is None:
+		return False
+	if letter == 'comment':
+		return str(old) == str(new)
+	try:
+		return abs(float(old) - float(new)) < 1e-9
+	except (TypeError, ValueError):
+		return False
+
+
+# _reload() (STD-поля) и ToolTableModelExt.update() (R/H/L/S) вызываются
+# ПОСЛЕДОВАТЕЛЬНО в одном и том же цикле обновления (framework вызывает
+# _reload(), затем передаёт результат в update(models)) — оба независимо
+# делали свой list_tools() ради ОДНИХ И ТЕХ ЖЕ данных. Однопоточный Qt GUI
+# thread, поэтому просто передаём ответ через маленький модульный кэш:
+# _reload() кладёт, update() забирает и сразу же удаляет (чтобы никогда не
+# читать устаревший ответ на следующем, не связанном с этим, цикле).
+_shared_list_tools_cache = {}
+
+
 def patch_tool_singleton_for_db_program(tool_singleton, db_client):
+	# Последнее известное STD-состояние КАЖДОГО инструмента (по данным
+	# последнего list_tools() из _reload()) — нужно _save() ниже, чтобы
+	# слать update_tool() только для реально изменившихся инструментов,
+	# а не для ВСЕХ N при правке одной ячейки (framework отдаёт в _save()
+	# снимок ВСЕЙ таблицы на любую правку — см. разбор ниже).
+	_last_std_by_tno = {}
+
 	def _reload(self):
 		"""Вернуть (tool_model, wear_model) в формате qt_tstat (16 полей):
 
@@ -823,6 +905,9 @@ def patch_tool_singleton_for_db_program(tool_singleton, db_client):
 		if db_client is not None:
 			try:
 				resp = db_client.list_tools()
+				# отдать тот же ответ ToolTableModelExt.update() ниже по
+				# этому же циклу обновления — см. комментарий выше класса.
+				_shared_list_tools_cache['resp'] = resp
 			except Exception as e:
 				LOG.error('list_tools failed: {}'.format(e))
 
@@ -865,6 +950,15 @@ def patch_tool_singleton_for_db_program(tool_singleton, db_client):
 			if tno == getattr(self, 'current_tool_num', None):
 				self.toolinfo = list(row)
 			tool_model.append(row)
+			# сохранить как "последнее известное состояние" для _save()
+			_last_std_by_tno[tno] = {
+				'P': row[1],
+				'X': row[2], 'Y': row[3], 'Z': row[4],
+				'A': row[5], 'B': row[6], 'C': row[7],
+				'U': row[8], 'V': row[9], 'W': row[10],
+				'D': row[11], 'I': row[12], 'J': row[13],
+				'Q': row[14], 'comment': comment,
+			}
 
 		if self.toolinfo is None:
 			self.toolinfo = [
@@ -879,12 +973,21 @@ def patch_tool_singleton_for_db_program(tool_singleton, db_client):
 		"""new_model уже после CONVERT_TO_STANDARD_TYPE — 16 полей на строку:
 		[0]=tool [1]=pocket [2..13]=X Y Z A B C U V W D I J [14]=Q [15]=comment
 
+		Framework вызывает это с ПОЛНЫМ снимком всей таблицы даже при
+		правке одной ячейки — поэтому шлём update_tool() только для
+		инструментов, чьи STD-поля реально отличаются от последнего
+		известного состояния (_last_std_by_tno, см. _reload() выше).
+		Без этой проверки редактирование одной ячейки посылало бы
+		update_tool() последовательно для КАЖДОГО инструмента в таблице
+		(легко подтверждается логами: N упорядоченных upsert подряд на
+		одну правку, итоговая задержка ~ N * (время одного upsert)).
+
 		Никакого файла и никакого MDI: в этой конфигурации LinuxCNC
 		получает данные инструментов через [EMCIO]DB_PROGRAM =
 		tool_db_daemon.py, поэтому изменения просто передаются демону
 		тем же db_client, что уже используется для R/H/L/S (см. setData
 		модели). Демон сам пишет в свою БД и сам говорит LinuxCNC
-		перечитать таблицу (bump_changed() -> notify_linuxcnc_reload()
+		перечитать таблицу (_finalize_write() -> notify_linuxcnc_reload()
 		-> linuxcnc.command().load_tool_table() внутри самого демона).
 		"""
 		if db_client is None:
@@ -893,6 +996,7 @@ def patch_tool_singleton_for_db_program(tool_singleton, db_client):
 
 		delete_set = set(delete)
 		for tno in delete_set:
+			_last_std_by_tno.pop(tno, None)
 			resp = db_client.delete_tool(tno)
 			if not resp or not resp.get('ok'):
 				err = (resp or {}).get('error') or 'unknown error'
@@ -939,11 +1043,32 @@ def patch_tool_singleton_for_db_program(tool_singleton, db_client):
 			# приводит типы через typ(val) — float(x) для int тоже ок
 			fields['comment'] = str(cell(15, '') or '').strip()
 
-			resp = db_client.update_tool(tno, fields)
+			# framework отдаёт сюда снимок ВСЕЙ таблицы при любой правке
+			# ОДНОЙ ячейки — без этой проверки редактирование одного
+			# инструмента слало бы update_tool() для КАЖДОГО инструмента
+			# в таблице (см. тайминги: T1..T30 подряд на одну правку,
+			# итоговая задержка ~ N * 24мс). Шлём только реально
+			# изменившиеся поля реально изменившихся инструментов.
+			prev = _last_std_by_tno.get(tno)
+			if prev is not None:
+				sent_fields = {
+					letter: val for letter, val in fields.items()
+					if not _std_field_equal(letter, prev.get(letter), val)
+				}
+			else:
+				# новый/ранее не виденный инструмент — шлём как есть
+				sent_fields = fields
+			if not sent_fields:
+				continue
+
+			resp = db_client.update_tool(tno, sent_fields)
 			if not resp or not resp.get('ok'):
 				LOG.error('update_tool T{} failed: {}'.format(
 					tno, (resp or {}).get('error')))
 			else:
+				# полным набором fields (не только отправленным diff'ом) —
+				# именно таково теперь реальное состояние строки в БД
+				_last_std_by_tno.setdefault(tno, {}).update(fields)
 				# comment в fields → StatusLabel(tool_comment_status)
 				_notify_tool_info_changed(tno, db_client)
 			# расширенные R/H/L/S сюда не входят — они пишутся через
@@ -1088,6 +1213,23 @@ def bind_ext_add_tool(view_instance, db_client):
 
 		try:
 			self.selectRow(row_index)
+			# прокрутить виджет так, чтобы новая строка (в конце таблицы)
+			# была видна целиком: EnsureVisible часто оставляет её
+			# обрезанной по нижней кромке viewport — PositionAtBottom
+			# ставит строку к низу, а singleShot дожимает scrollbar
+			# уже после пересчёта геометрии вставленной строки.
+			idx = model.index(row_index, 0)
+			if idx.isValid():
+				self.scrollTo(idx, QAbstractItemView.PositionAtBottom)
+				def _scroll_new_row_fully():
+					try:
+						self.scrollTo(idx, QAbstractItemView.PositionAtBottom)
+						sb = self.verticalScrollBar()
+						if sb is not None:
+							sb.setValue(sb.maximum())
+					except Exception:
+						pass
+				QTimer.singleShot(0, _scroll_new_row_fully)
 		except Exception:
 			pass
 
@@ -1189,13 +1331,32 @@ class _TrimmedDoubleSpinBox(QDoubleSpinBox):
 		return fmt_trim_zeros(value, self.decimals())
 
 	def valueFromText(self, text):
-		text = text.strip()
+		# и ',' и '.' — десятичный разделитель (locale C / G-code)
+		text = (text or '').strip().replace(',', '.')
 		if not text or text in ('-', '.', '-.'):
 			return 0.0
 		try:
 			return float(text)
 		except ValueError:
 			return 0.0
+
+	def validate(self, text, pos):
+		# C-locale отвергает ',': проверяем с '.', в поле оставляем ввод оператора
+		fixed = (text or '').replace(',', '.')
+		state, _, newpos = super().validate(fixed, pos)
+		return state, text, newpos
+
+	def fixup(self, text):
+		return super().fix((text or '').replace(',', '.'))
+
+	def keyPressEvent(self, event):
+		# запятая на клавиатуре → точка
+		if event.text() == ',':
+			from PyQt5.QtGui import QKeyEvent
+			event = QKeyEvent(
+				event.type(), Qt.Key_Period, event.modifiers(),
+				'.', event.isAutoRepeat(), event.count())
+		super().keyPressEvent(event)
 
 
 class _ToolTableItemEditorFactory(QItemEditorFactory):
